@@ -7,6 +7,7 @@ This module provides:
 - Memory management utilities
 """
 
+import ast
 import asyncio
 import gc
 import os
@@ -20,8 +21,8 @@ import psutil
 
 # Configuration for tool execution
 TOOL_CONFIGS = {
-    "max_turns": 16,
-    "max_tool_calls": 16,
+    "max_turns": 32,
+    "max_tool_calls": 32,
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
@@ -98,6 +99,7 @@ class PythonSandbox:
         self.memory_limit = memory_limit
         self.allowed_modules = {
             "math",
+            "cmath",  # Complex number math library
             "random",
             "datetime",
             "collections",
@@ -107,6 +109,9 @@ class PythonSandbox:
             "statistics",
             "decimal",
             "fractions",
+            "numpy",
+            "scipy",
+            "sympy",
         }
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
@@ -143,7 +148,10 @@ class PythonSandbox:
             r"property\s*\(",
             r"staticmethod\s*\(",
             r"classmethod\s*\(",
-            r"__\w+__",  # double underscore methods
+            # Note: __import__ is already blocked above
+            # Other dangerous dunder methods like __builtins__, __globals__
+            # require getattr/setattr which are already blocked
+            # Safe dunders like __name__, __main__, __init__, __str__ are allowed
         ]
 
         for pattern in dangerous_patterns:
@@ -151,11 +159,13 @@ class PythonSandbox:
                 return False, f"Code contains dangerous pattern: {pattern}"
 
         # Check imported modules
-        import_pattern = r"import\s+(\w+)"
-        from_pattern = r"from\s+(\w+)"
+        # Match "import math" at line start (with optional indentation)
+        import_pattern = r"^\s*import\s+(\w+)"
+        # Match "from math import gcd" - only check the module name, not the imported name
+        from_pattern = r"^\s*from\s+(\w+)\s+import"
 
-        imports = re.findall(import_pattern, code)
-        froms = re.findall(from_pattern, code)
+        imports = re.findall(import_pattern, code, re.MULTILINE)
+        froms = re.findall(from_pattern, code, re.MULTILINE)
 
         all_imports = set(imports + froms)
         for imp in all_imports:
@@ -202,6 +212,36 @@ class PythonSandbox:
         is_safe, message = self._check_code_safety(code)
         if not is_safe:
             return f"Error: {message}"
+
+        # Auto-add print() to the last expression using AST
+        # This handles cases where model outputs a variable name without print()
+        # AST approach: precise, handles all statement types automatically
+        try:
+            tree = ast.parse(code)
+            if tree.body and isinstance(tree.body[-1], ast.Expr):
+                last_expr = tree.body[-1].value
+                
+                # Check if it's already a print() call - don't double-wrap
+                is_print_call = (
+                    isinstance(last_expr, ast.Call) and
+                    isinstance(last_expr.func, ast.Name) and
+                    last_expr.func.id == 'print'
+                )
+                
+                if not is_print_call:
+                    # Wrap the expression in print()
+                    print_call = ast.Expr(
+                        value=ast.Call(
+                            func=ast.Name(id='print', ctx=ast.Load()),
+                            args=[last_expr],
+                            keywords=[]
+                        )
+                    )
+                    tree.body[-1] = print_call
+                    code = ast.unparse(tree)
+        except SyntaxError:
+            # Syntax error in code, return as-is (will be caught during execution)
+            pass
 
         # Add necessary wrapper code with memory limits
         # Properly indent the user code within the try block
@@ -316,10 +356,21 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "code_interpreter",
-                    "description": "A tool for executing Python code in a safe sandbox environment.",
+                    "description": (
+                        "Execute Python code in a safe sandbox. Each call starts a fresh Python process "
+                        "with an empty namespace; previous imports, variables, and functions are not available."
+                    ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
+                        "properties": {
+                            "code": {
+                                "type": "string",
+                                "description": (
+                                    "Complete, self-contained Python code to execute, including all imports, "
+                                    "variables, and functions used in this call."
+                                ),
+                            }
+                        },
                         "required": ["code"],
                     },
                 },

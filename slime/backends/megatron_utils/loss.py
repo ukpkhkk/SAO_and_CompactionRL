@@ -18,6 +18,7 @@ from slime.utils.ppo_utils import (
     compute_opsm_mask,
     compute_policy_loss,
     get_advantages_and_returns_batch,
+    get_compaction_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
@@ -199,7 +200,7 @@ def _allgather_cp_redistribute(
             if value is None or e <= s:
                 # This rank has no response logprobs for this sample
                 full_resp = torch.zeros(
-                    response_length,
+                    (response_length, *ref_value.shape[1:]),
                     dtype=ref_dtype,
                     device=ref_device,
                     requires_grad=ref_value.requires_grad,
@@ -207,7 +208,9 @@ def _allgather_cp_redistribute(
             else:
                 resp_start = s - logit_global_start
                 resp_end = e - logit_global_start
-                full_resp = F.pad(value, (resp_start, response_length - resp_end))
+                left = value.new_zeros((resp_start, *value.shape[1:]))
+                right = value.new_zeros((response_length - resp_end, *value.shape[1:]))
+                full_resp = torch.cat([left, value, right], dim=0)
 
             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
             full_resps.append(full_resp)
@@ -561,6 +564,20 @@ def get_log_probs_and_entropy(
     return torch.empty((0,), device=device), res
 
 
+def _value_support(args: Namespace, device: torch.device) -> torch.Tensor:
+    low, high = args.value_reward_range
+    return torch.linspace(low, high, steps=args.value_num_bins, device=device, dtype=torch.float32)
+
+
+def predict_values_from_logits(args: Namespace, logits_chunk: torch.Tensor) -> torch.Tensor:
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        support = _value_support(args, logits_chunk.device)
+        return logits_chunk.float().softmax(dim=-1) @ support
+
+    assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
+    return logits_chunk.squeeze(-1)
+
+
 def get_values(
     logits: torch.Tensor,
     *,
@@ -574,10 +591,13 @@ def get_values(
     """Extract per-token value predictions over response tokens.
 
     For each sample, extracts response-aligned chunks from the value head
-    output and squeezes the final dimension from `[R, 1]` to `[R]`.
+    output. Scalar value heads are squeezed from `[R, 1]` to `[R]`;
+    classification value heads are decoded by taking the softmax expectation
+    over the configured support.
 
     Args:
-        logits: Value head output with shape `[1, T, 1]`.
+        logits: Value head output with shape `[1, T, 1]` for MSE or
+            `[1, T, value_num_bins]` for classification.
         args: Configuration passed to `get_responses`; temperature scaling is
             disabled for value outputs.
         unconcat_tokens: List of token tensors per sample.
@@ -599,8 +619,7 @@ def get_values(
         response_lengths=response_lengths,
         apply_temperature=False,
     ):
-        assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
+        value_list.append(predict_values_from_logits(args, logits_chunk))
 
     res = {
         "values": value_list,
@@ -658,6 +677,108 @@ def apply_opd_kl_to_advantages(
     rollout_data["opd_reverse_kl"] = reverse_kls
 
 
+def _compute_overlong_rewards(args: Namespace, rollout_data: RolloutBatch, like: list[torch.Tensor]) -> list[torch.Tensor]:
+    if args.overlong_reward_coef == 0:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    max_len = args.overlong_reward_max_len or args.rollout_max_response_len
+    if max_len is None or max_len <= 0:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    threshold = args.overlong_reward_threshold_ratio * max_len
+    cp_size = mpu.get_context_parallel_world_size()
+
+    rewards: list[torch.Tensor] = []
+    for target, response_length, total_length in zip(
+        like,
+        rollout_data["response_lengths"],
+        rollout_data["total_lengths"],
+        strict=False,
+    ):
+        if response_length <= threshold:
+            rewards.append(torch.zeros_like(target, dtype=torch.float32))
+            continue
+
+        if response_length >= max_len:
+            unscaled_penalty = -args.overlong_reward_max_penalty
+        else:
+            soft_penalty_span = (1.0 - args.overlong_reward_threshold_ratio) * max_len
+            unscaled_penalty = (threshold - float(response_length)) / max(soft_penalty_span, 1.0)
+        total_penalty = args.overlong_reward_coef * unscaled_penalty
+
+        full_reward = torch.zeros(response_length, device=target.device, dtype=torch.float32)
+        full_reward[-1] = total_penalty
+        if cp_size > 1:
+            full_reward = slice_log_prob_with_cp(full_reward, total_length, response_length)
+        rewards.append(full_reward.to(device=target.device, dtype=torch.float32))
+
+    return rewards
+
+
+def _compute_answer_format_rewards(
+    args: Namespace, rollout_data: RolloutBatch, like: list[torch.Tensor]
+) -> list[torch.Tensor]:
+    if args.answer_format_reward_coef == 0:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    format_rewards = rollout_data.get("answer_format_rewards")
+    if not format_rewards:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    cp_size = mpu.get_context_parallel_world_size()
+    rewards: list[torch.Tensor] = []
+    for target, format_reward, response_length, total_length in zip(
+        like,
+        format_rewards,
+        rollout_data["response_lengths"],
+        rollout_data["total_lengths"],
+        strict=False,
+    ):
+        if response_length <= 0:
+            rewards.append(torch.zeros_like(target, dtype=torch.float32))
+            continue
+
+        full_reward = torch.zeros(response_length, device=target.device, dtype=torch.float32)
+        full_reward[-1] = args.answer_format_reward_coef * float(format_reward)
+        if cp_size > 1:
+            full_reward = slice_log_prob_with_cp(full_reward, total_length, response_length)
+        rewards.append(full_reward.to(device=target.device, dtype=torch.float32))
+
+    return rewards
+
+
+def _compute_tool_call_format_rewards(
+    args: Namespace, rollout_data: RolloutBatch, like: list[torch.Tensor]
+) -> list[torch.Tensor]:
+    if args.tool_call_format_reward_coef == 0:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    format_rewards = rollout_data.get("tool_call_format_rewards")
+    if not format_rewards:
+        return [torch.zeros_like(x, dtype=torch.float32) for x in like]
+
+    cp_size = mpu.get_context_parallel_world_size()
+    rewards: list[torch.Tensor] = []
+    for target, format_reward, response_length, total_length in zip(
+        like,
+        format_rewards,
+        rollout_data["response_lengths"],
+        rollout_data["total_lengths"],
+        strict=False,
+    ):
+        if response_length <= 0:
+            rewards.append(torch.zeros_like(target, dtype=torch.float32))
+            continue
+
+        full_reward = torch.zeros(response_length, device=target.device, dtype=torch.float32)
+        full_reward[-1] = args.tool_call_format_reward_coef * float(format_reward)
+        if cp_size > 1:
+            full_reward = slice_log_prob_with_cp(full_reward, total_length, response_length)
+        rewards.append(full_reward.to(device=target.device, dtype=torch.float32))
+
+    return rewards
+
+
 def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
     """Compute advantages and returns in-place based on `args.advantage_estimator`.
 
@@ -693,6 +814,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     response_lengths: list[int] = rollout_data.get("response_lengths")
     loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
     total_lengths: list[int] = rollout_data.get("total_lengths")
+    metadata: list[dict[str, Any]] | None = rollout_data.get("metadata")
     # return when not the last pp stage.
     if not mpu.is_pipeline_last_stage():
         return
@@ -711,6 +833,12 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
     rollout_data["kl"] = kl
+    overlong_rewards = _compute_overlong_rewards(args, rollout_data, kl)
+    rollout_data["overlong_rewards"] = overlong_rewards
+    answer_format_token_rewards = _compute_answer_format_rewards(args, rollout_data, kl)
+    rollout_data["answer_format_token_rewards"] = answer_format_token_rewards
+    tool_call_format_token_rewards = _compute_tool_call_format_rewards(args, rollout_data, kl)
+    rollout_data["tool_call_format_token_rewards"] = tool_call_format_token_rewards
 
     if args.custom_advantage_function_path is not None:
         custom_adv_fn = load_function(args.custom_advantage_function_path)
@@ -728,14 +856,61 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         rewards = []
         kl_coef = -args.kl_coef
         cp_rank = mpu.get_context_parallel_rank()
-        for reward, k in zip(old_rewards, kl, strict=False):
-            k *= kl_coef
-            if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
-        advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+        is_compaction_batch = bool(
+            getattr(args, "enable_compaction_rl", False)
+            and metadata
+            and any(isinstance(meta, dict) and meta.get("compaction", {}).get("enabled") for meta in metadata)
         )
+        segment_reward_mode = getattr(args, "compaction_segment_reward_mode", "paper_each_segment")
+        for idx, (reward, k, overlong_reward, answer_format_reward, tool_call_format_reward) in enumerate(zip(
+            old_rewards,
+            kl,
+            overlong_rewards,
+            answer_format_token_rewards,
+            tool_call_format_token_rewards,
+            strict=False,
+        )):
+            k *= kl_coef
+            k += overlong_reward
+            k += answer_format_reward
+            k += tool_call_format_reward
+            final_reward = reward
+            if is_compaction_batch and segment_reward_mode == "last_segment_only":
+                compaction_meta = metadata[idx].get("compaction", {}) if isinstance(metadata[idx], dict) else {}
+                if not compaction_meta.get("is_final_answer_segment", False):
+                    final_reward = 0.0
+            if cp_rank == 0:
+                k[-1] += final_reward
+            rewards.append(k)
+        
+        chunked = True
+        
+        if args.enable_length_adaptive:
+            chunked = False
+
+        # advantages, returns = get_advantages_and_returns_batch(loss_mask,
+        #     total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+        # )
+        print(f'enable_length_adaptive:{args.enable_length_adaptive}, skip_observation_gae:{args.skip_observation_gae}')
+        if is_compaction_batch:
+            advantages, returns = get_compaction_advantages_and_returns_batch(
+                loss_masks,
+                total_lengths,
+                response_lengths,
+                values,
+                rewards,
+                args.gamma,
+                args.lambd,
+                metadata,
+                chunked=chunked,
+                enable_length_adaptive=args.enable_length_adaptive,
+                adaptive_alpha=args.adaptive_alpha,
+                skip_observation=args.skip_observation_gae,
+            )
+        else:
+            advantages, returns = get_advantages_and_returns_batch(loss_masks,
+                total_lengths, response_lengths, values, rewards, args.gamma, args.lambd, chunked=chunked, enable_length_adaptive=args.enable_length_adaptive,
+            adaptive_alpha=args.adaptive_alpha, skip_observation=args.skip_observation_gae)
 
     elif args.advantage_estimator == "reinforce_plus_plus":
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
@@ -849,6 +1024,33 @@ def vanilla_tis_function(
         "tis_abs": tis_abs.clone().detach(),
     }
     pg_loss = pg_loss * tis_weights
+    return pg_loss, loss_masks, metrics
+
+
+def vanilla_dis_function(
+    args,
+    *,
+    pg_loss: torch.Tensor,
+    train_log_probs: list[torch.Tensor],
+    rollout_log_probs: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+    **kwargs: Any,
+) -> tuple[torch.Tensor, list[torch.Tensor], dict[str, torch.Tensor]]:
+    rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
+    old_log_probs = torch.cat(train_log_probs, dim=0)
+    dis = torch.exp(old_log_probs - rollout_log_probs)
+    dis_abs = (dis - 1).abs()
+    lower_bound = 1.0 - args.dis_clip_low
+    upper_bound = 1.0 + args.dis_clip
+    dis_valid = (dis >= lower_bound) & (dis <= upper_bound)
+    dis_weights = torch.where(dis_valid, dis, torch.zeros_like(dis))
+    dis_clipfrac = (~dis_valid).float()
+    metrics = {
+        "dis": dis.clone().detach(),
+        "dis_clipfrac": dis_clipfrac.clone().detach(),
+        "dis_abs": dis_abs.clone().detach(),
+    }
+    pg_loss = pg_loss * dis_weights
     return pg_loss, loss_masks, metrics
 
 
@@ -984,9 +1186,9 @@ def policy_loss_function(
         pg_loss = pg_loss * opsm_mask
 
     # Apply off-policy correction using importance sampling if enabled
-    if args.get_mismatch_metrics or args.use_tis:
+    if args.get_mismatch_metrics or args.use_tis or args.use_dis:
         # NOTE:
-        # `tis_func` may apply rejection-sampling style masking (RS) and return `modified_response_masks`.
+        # `is_func` may apply rejection-sampling style masking (RS) and return `modified_response_masks`.
         # We rebuild `sum_of_sample_mean` with those masks to correct denominators for loss/backprop.
         #
         # However, mismatch/TIS/RS metrics (e.g., "truncate_fraction") are often defined over the
@@ -995,10 +1197,10 @@ def policy_loss_function(
         # Keep a copy of the original reducer (based on `batch["loss_masks"]`) for metric aggregation.
         sum_of_sample_mean_for_mismatch_metrics = sum_of_sample_mean
 
-        assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
+        assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS/DIS"
 
         ois = (-ppo_kl).exp()
-        tis_kwargs = {
+        is_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
             "train_log_probs": train_log_probs_for_tis,
@@ -1008,11 +1210,13 @@ def policy_loss_function(
             "response_lengths": response_lengths,
         }
 
-        if args.custom_tis_function_path is not None:
-            tis_func = load_function(args.custom_tis_function_path)
+        if args.use_dis:
+            is_func = vanilla_dis_function
+        elif args.custom_tis_function_path is not None:
+            is_func = load_function(args.custom_tis_function_path)
         else:
-            tis_func = vanilla_tis_function
-        pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
+            is_func = vanilla_tis_function
+        pg_loss, modified_response_masks, is_metrics = is_func(**is_kwargs)
 
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with
         # modified_response_masks for numerator correction (rejected tokens
@@ -1032,7 +1236,9 @@ def policy_loss_function(
     if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
-        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_masks = (
+            modified_response_masks if (args.get_mismatch_metrics or args.use_tis or args.use_dis) else batch["loss_masks"]
+        )
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
@@ -1090,12 +1296,12 @@ def policy_loss_function(
     if args.use_kl_loss:
         reported_loss["kl_loss"] = kl_loss.clone().detach()
 
-    if args.get_mismatch_metrics or args.use_tis:
+    if args.get_mismatch_metrics or args.use_tis or args.use_dis:
         # Aggregate mismatch/TIS/RS related metrics with the *pre-RS* masks.
         # See comment above where `sum_of_sample_mean_for_mismatch_metrics` is defined.
         reported_loss["ois"] = sum_of_sample_mean_for_mismatch_metrics(ois).clone().detach()
         # Assume all metrics are already cloned and detached
-        for metric_key, metric_value in tis_metrics.items():
+        for metric_key, metric_value in is_metrics.items():
             key_name = f"{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean_for_mismatch_metrics(metric_value)
 
@@ -1110,59 +1316,132 @@ def policy_loss_function(
     return loss, reported_loss
 
 
+def _two_hot_target_distribution(targets: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    num_bins = support.shape[0]
+    low, high = support[0].item(), support[-1].item()
+    normalized = (targets.float().clamp(low, high) - low) / (high - low)
+    positions = normalized * (num_bins - 1)
+    lower = positions.floor().long()
+    upper = positions.ceil().long()
+    upper_weight = positions - lower.float()
+    lower_weight = 1.0 - upper_weight
+    distribution = torch.zeros((*targets.shape, num_bins), dtype=torch.float32, device=targets.device)
+    distribution.scatter_add_(-1, lower.unsqueeze(-1), lower_weight.unsqueeze(-1))
+    distribution.scatter_add_(-1, upper.unsqueeze(-1), upper_weight.unsqueeze(-1))
+    return distribution
+
+
+def _hl_gauss_target_distribution(
+    targets: torch.Tensor, support: torch.Tensor, sigma_ratio: float = 0.75
+) -> torch.Tensor:
+    bin_width = support[1] - support[0]
+    sigma = sigma_ratio * bin_width
+
+    bin_lo = support - bin_width / 2
+    bin_hi = support + bin_width / 2
+    mu = targets.float().clamp(support[0], support[-1]).unsqueeze(-1)
+    cdf_hi = 0.5 * (1.0 + torch.erf((bin_hi - mu) / (sigma * 1.4142135623730951)))
+    cdf_lo = 0.5 * (1.0 + torch.erf((bin_lo - mu) / (sigma * 1.4142135623730951)))
+    probs = cdf_hi - cdf_lo
+    return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def _get_value_logits_list(logits: torch.Tensor, args: Namespace, batch: RolloutBatch) -> list[torch.Tensor]:
+    raw_list = []
+    for logits_chunk, _ in get_responses(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        apply_temperature=False,
+    ):
+        raw_list.append(logits_chunk)
+
+    if args.allgather_cp:
+        res = {"value_logits": raw_list}
+        _allgather_cp_redistribute(
+            res,
+            logits_local_len=logits.size(1),
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+        )
+        raw_list = res["value_logits"]
+
+    return raw_list
+
+
 def value_loss_function(
     args: Namespace,
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute clipped value loss and metrics.
+    """Compute value loss and metrics.
 
-    Extracts current value predictions from `logits`, compares them against
-    stored old values with clipping, and computes the maximum of clipped and
-    unclipped squared errors (PPO-style value clipping).
-
-    Args:
-        args: Configuration containing `value_clip` threshold.
-        batch: Mini-batch with "values" (old predictions), "returns",
-            "unconcat_tokens", "total_lengths", and "response_lengths".
-        logits: Value head output with shape `[1, T, 1]`.
-        sum_of_sample_mean: Reduction function that averages per-sample values.
-
-    Returns:
-        Tuple of `(loss, metrics)` where `loss` is a scalar tensor and
-        `metrics` contains detached scalars "value_loss" and "value_clipfrac".
+    Supports scalar PPO-style clipped MSE and categorical classification value
+    loss. Classification projects scalar returns onto a discrete support and
+    trains the critic with cross entropy over value bins.
     """
     old_values = torch.cat(batch["values"], dim=0)
-
-    _, values = get_values(
-        logits,
-        args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
-        total_lengths=batch["total_lengths"],
-        response_lengths=batch["response_lengths"],
-    )
-    values = torch.cat([value.flatten() for value in values["values"]], dim=0)
-
     returns = torch.cat(batch["returns"], dim=0)
 
-    values_clipfrac = torch.abs(values - old_values) > args.value_clip
-    values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
-    surr1 = (values_clipped - returns) ** 2
-    surr2 = (values - returns) ** 2
-    loss = torch.max(surr1, surr2)
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        num_bins = args.value_num_bins
+        raw_logits_list = _get_value_logits_list(logits, args, batch)
+        raw_logits = torch.cat([value_logits.reshape(-1, num_bins) for value_logits in raw_logits_list], dim=0)
 
-    loss = sum_of_sample_mean(loss)
-    values_clipfrac = sum_of_sample_mean(values_clipfrac.float())
+        support = _value_support(args, raw_logits.device)
+        values = raw_logits.float().softmax(dim=-1) @ support
 
-    # make sure the gradient could backprop correctly.
-    if values.numel() == 0:
-        loss += 0 * values.sum()
+        if args.value_target_type == "hl_gauss":
+            target_dist = _hl_gauss_target_distribution(returns, support, args.hl_gauss_sigma_ratio)
+        else:
+            target_dist = _two_hot_target_distribution(returns, support)
 
-    reported_loss = {
-        "value_loss": loss.clone().detach(),
-        "value_clipfrac": values_clipfrac.clone().detach(),
-    }
+        log_probs = F.log_softmax(raw_logits.float(), dim=-1)
+        per_token_loss = -(target_dist * log_probs).sum(dim=-1)
+        loss = sum_of_sample_mean(per_token_loss)
+
+        if values.numel() == 0:
+            loss += 0 * raw_logits.sum()
+
+        probs = log_probs.exp()
+        nearest_bin = target_dist.argmax(dim=-1)
+        reported_loss = {
+            "value_loss": loss.clone().detach(),
+            "value_accuracy": sum_of_sample_mean((raw_logits.argmax(dim=-1) == nearest_bin).float()).detach(),
+            "value_entropy": sum_of_sample_mean(-(probs * log_probs).sum(dim=-1)).detach(),
+            "value_confidence": sum_of_sample_mean(probs.max(dim=-1).values).detach(),
+        }
+    else:
+        _, values = get_values(
+            logits,
+            args=args,
+            unconcat_tokens=batch["unconcat_tokens"],
+            total_lengths=batch["total_lengths"],
+            response_lengths=batch["response_lengths"],
+        )
+        values = torch.cat([value.flatten() for value in values["values"]], dim=0)
+
+        values_clipfrac = torch.abs(values - old_values) > args.value_clip
+        values_clipped = old_values + (values - old_values).clamp(-args.value_clip, args.value_clip)
+        surr1 = (values_clipped - returns) ** 2
+        surr2 = (values - returns) ** 2
+        loss = torch.max(surr1, surr2)
+
+        print(f'old_values:{old_values.mean()}, values:{values.mean()}, returns:{returns.mean()} , values_loss:{loss.mean()}')
+
+        loss = sum_of_sample_mean(loss)
+        values_clipfrac = sum_of_sample_mean(values_clipfrac.float())
+
+        if values.numel() == 0:
+            loss += 0 * values.sum()
+
+        reported_loss = {
+            "value_loss": loss.clone().detach(),
+            "value_clipfrac": values_clipfrac.clone().detach(),
+        }
 
     return loss, reported_loss
 

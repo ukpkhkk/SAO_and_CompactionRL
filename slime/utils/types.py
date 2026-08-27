@@ -104,6 +104,12 @@ class Sample:
     # sibling, so loss aggregation averages within the rollout instead of
     # over-counting it.
     rollout_id: int | None = None
+    # Windowed FIFO / fully-async rollout timing metadata.
+    entry_step: int | None = None
+    completed_step: int | None = None
+    used_step: int | None = None
+    off_step: int = 0
+    entry_delay_step: int | None = None
     # prompt
     prompt: str | list[dict[str, str]] = ""
     tokens: list[int] = field(default_factory=list)

@@ -290,6 +290,7 @@ def log_rollout_data(
                 "global_batch_sizes",
                 "num_microbatches",
                 "micro_batch_indices",
+                "metadata",
                 "source_names",
             ]:
                 continue
@@ -310,6 +311,9 @@ def log_rollout_data(
                         "values",
                         "teacher_log_probs",
                         "opd_reverse_kl",
+                        "overlong_rewards",
+                        "answer_format_token_rewards",
+                        "tool_call_format_token_rewards",
                     ]:
                         tensor = torch.cat(val).clone().detach()
                         sum_of_sample_mean = get_sum_of_sample_mean(

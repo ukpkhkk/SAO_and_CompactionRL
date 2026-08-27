@@ -3,6 +3,7 @@ import copy
 import inspect
 import json
 import logging
+import threading
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -92,7 +93,10 @@ class GenerateState(metaclass=SingletonMeta):
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(args.sglang_server_concurrency * get_rollout_num_engines(args))
+        self._semaphore_capacity = args.sglang_server_concurrency * get_rollout_num_engines(args)
+        self._semaphore_lock = threading.Lock()
+        self._semaphores = {}
+        self.semaphore = asyncio.Semaphore(self._semaphore_capacity)
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -116,6 +120,23 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_rank = 0
 
         self.reset()
+
+    def get_semaphore(self) -> asyncio.Semaphore:
+        """Return the semaphore bound to the current event loop.
+
+        Windowed FIFO rollout runs in its own background event loop while eval
+        can run in slime.utils.async_utils' loop. asyncio.Semaphore instances
+        cannot be shared across loops once they have waiters, so keep one
+        semaphore per loop under the same GenerateState singleton.
+        """
+        loop = asyncio.get_running_loop()
+        with self._semaphore_lock:
+            semaphore = self._semaphores.get(loop)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self._semaphore_capacity)
+                self._semaphores[loop] = semaphore
+            self.semaphore = semaphore
+            return semaphore
 
     @contextmanager
     def dp_rank_context(self):
@@ -241,7 +262,7 @@ async def generate_and_rm(
     state = GenerateState(args)
 
     # generate
-    async with state.semaphore:
+    async with state.get_semaphore():
         if state.aborted:
             sample.status = Sample.Status.ABORTED
             return sample

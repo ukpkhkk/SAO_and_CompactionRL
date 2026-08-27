@@ -294,6 +294,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                             --freeze-params-name-list linear_fc1
                         """,
             )
+            parser.add_argument("--critic-freeze-params-name-list", type=str, nargs="*",
+                default=None,
+                help="""List of regex patterns of parameter names to FREEZE. Other parameters will remain trainable.
+                        Supports Python regex syntax (re.search).
+
+                        Examples:
+                        1. Freeze Embeddings and Output Layer (common for fine-tuning):
+                            --freeze-params-name-list embedding output_layer
+
+                        2. Freeze Indexer parameters:
+                            --freeze-params-name-list self_attention.wq_b self_attention.wk self_attention.k_norm self_attention.weights_proj
+
+                        3. Freeze specific projection layers (e.g., all Gate/Up projections):
+                            --freeze-params-name-list linear_fc1
+                        """,)
             parser.add_argument(
                 "--allgather-cp",
                 action="store_true",
@@ -492,6 +507,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-log-dir",
+                type=str,
+                default=None,
+                help="Directory to save rollout and eval JSONL logs when a custom rollout logger is enabled.",
+            )
+            parser.add_argument(
                 "--custom-eval-rollout-log-function-path",
                 type=str,
                 default=None,
@@ -510,6 +531,35 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Path to the buffer filter function. "
                     "It should be able to select the samples in the buffer. "
                     "The function should take list[list[Sample]] and return list[list[Sample]]."
+                ),
+            )
+            parser.add_argument(
+                "--windowed-fifo-max-prefetch-steps",
+                type=int,
+                default=8,
+                help=(
+                    "Maximum number of entry_steps ahead of the current training step "
+                    "that the worker is allowed to prefetch data for inference. "
+                    "Controls how far ahead the worker pulls data from the buffer "
+                    "relative to the current training progress. A larger value allows "
+                    "more aggressive prefetching (higher throughput but more stale data), "
+                    "while a smaller value reduces staleness at the cost of potential "
+                    "throughput drops. Only effective in fully-async rollout mode with "
+                    "Windowed FIFO enabled. Default: 8."
+                ),
+            )
+            parser.add_argument(
+                "--windowed-fifo-max-delay-step",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of training steps a sample group can be delayed "
+                    "before it must be included in training (Windowed FIFO). "
+                    "When set (>=1), sample groups that have waited this many steps "
+                    "are force-included in the next training batch. If an expired "
+                    "group is still in-flight and all already-collected groups are "
+                    "also stale, the in-flight group is discarded and re-queued. "
+                    "Only effective in fully-async rollout mode."
                 ),
             )
             # update weight
@@ -868,6 +918,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             reset_arg(parser, "--clip-grad", type=float, default=1.0)
             reset_arg(parser, "--calculate-per-token-loss", action="store_true")
             reset_arg(parser, "--lr", type=float, default=1e-6)
+            parser.add_argument(
+                "--critic-lr",
+                type=float,
+                default=None,
+                help=(
+                    "Learning rate for the critic model. If set, this overrides the critic role's "
+                    "`lr`, including any lr configured through --megatron-config-path."
+                ),
+            )
 
             parser.add_argument(
                 "--num-critic-only-steps",
@@ -895,6 +954,44 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
+            parser.add_argument(
+                "--value-loss-type",
+                type=str,
+                default="mse",
+                choices=["mse", "classification"],
+                help="value loss type: 'mse' for scalar regression, 'classification' for categorical distribution (C51-style)",
+            )
+            parser.add_argument(
+                "--value-num-bins",
+                type=int,
+                default=2,
+                help="number of categorical support bins for classification value loss",
+            )
+            parser.add_argument(
+                "--value-reward-range",
+                type=float,
+                nargs=2,
+                default=[0.0, 1.0],
+                metavar=("LOW", "HIGH"),
+                help="reward range for classification value loss support",
+            )
+            parser.add_argument(
+                "--value-target-type",
+                type=str,
+                default="two_hot",
+                choices=["two_hot", "hl_gauss"],
+                help=(
+                    "target distribution projection for classification value loss: "
+                    "'two_hot' for linear interpolation to 2 adjacent bins, "
+                    "'hl_gauss' for Gaussian CDF smoothing over ~6 bins (recommended for num_bins >= 21)"
+                ),
+            )
+            parser.add_argument(
+                "--hl-gauss-sigma-ratio",
+                type=float,
+                default=0.75,
+                help="sigma / bin_width ratio for HL-Gauss target distribution (default 0.75, paper recommended)",
+            )
             parser.add_argument(
                 "--kl-coef",
                 type=float,
@@ -991,6 +1088,82 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--entropy-coef", type=float, default=0.0, help="Entropy loss coef")
             parser.add_argument("--gamma", type=float, default=1.0, help="PPO GAE gamma")
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
+            parser.add_argument("--critic-lambd", type=float, default=1.0, help="critic lambd for vapo")
+            parser.add_argument("--enable-length-adaptive", action="store_true", default=False)
+            parser.add_argument("--adaptive-alpha", type=float, default=1.5, help="for length-adaptive gae such as vapo")
+            parser.add_argument("--skip-observation-gae", action="store_true", help="skip observation for gae such as SAO")
+            parser.add_argument(
+                "--overlong-reward-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for DAPO-like overlong response process reward. "
+                    "The terminal-token penalty is bounded by "
+                    "-overlong_reward_coef * overlong_reward_max_penalty."
+                ),
+            )
+            parser.add_argument(
+                "--overlong-reward-threshold-ratio",
+                type=float,
+                default=0.85,
+                help="Response length ratio where overlong reward shaping starts.",
+            )
+            parser.add_argument(
+                "--overlong-reward-max-penalty",
+                type=float,
+                default=1.0,
+                help="Maximum unscaled overlong penalty once response length reaches L_max.",
+            )
+            parser.add_argument(
+                "--overlong-reward-max-len",
+                type=int,
+                default=None,
+                help="L_max for overlong reward shaping. Defaults to rollout_max_response_len when unset.",
+            )
+            parser.add_argument(
+                "--answer-format-reward-coef",
+                type=float,
+                default=0.0,
+                help="Coefficient for terminal-token answer format reward. The unscaled value is +1/-1.",
+            )
+            parser.add_argument(
+                "--tool-call-format-reward-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for terminal-token tool-call format reward. "
+                    "The unscaled value is +1 for tool calls followed only by whitespace and optional <|im_end|>, "
+                    "-1 for malformed/continued tool calls, and 0 when no tool call is present."
+                ),
+            )
+            parser.add_argument("--enable-compaction-rl", action="store_true", default=False)
+            parser.add_argument(
+                "--compaction-max-context-len",
+                type=int,
+                default=None,
+                help="Total rollout-side context budget used after CompactionRL rebuilds the active context.",
+            )
+            parser.add_argument(
+                "--compaction-trigger-len",
+                type=int,
+                default=10240,
+                help="Trigger compaction when the active context length reaches this token count.",
+            )
+            parser.add_argument("--compaction-max-count", type=int, default=3)
+            parser.add_argument("--compaction-recent-steps", type=int, default=2)
+            parser.add_argument("--compaction-summary-max-new-tokens", type=int, default=1024)
+            parser.add_argument("--compaction-summary-temperature", type=float, default=None)
+            parser.add_argument(
+                "--compaction-segment-reward-mode",
+                type=str,
+                default="paper_each_segment",
+                choices=["paper_each_segment", "last_segment_only"],
+            )
+            parser.add_argument("--compaction-summary-prompt-path", type=str, default=None)
+            parser.add_argument("--compaction-resume-template-path", type=str, default=None)
+            parser.add_argument("--compaction-log-samples", action="store_true", default=False)
+            parser.add_argument("--critic-update-ratio", type=int, default=1, help="critic update raito with actor")
+
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
                 "--disable-grpo-std-normalization",
@@ -1064,6 +1237,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0,
                 help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
+            )
+            parser.add_argument(
+                "--use-dis",
+                action="store_true",
+                default=False,
+                help="Enable SAO DIS by zeroing out importance sampling ratios outside [1 - dis_clip_low, 1 + dis_clip].",
+            )
+            parser.add_argument(
+                "--dis-clip",
+                type=float,
+                default=2.0,
+                help="Upper-side epsilon for SAO DIS; the upper ratio bound is 1 + dis_clip.",
+            )
+            parser.add_argument(
+                "--dis-clip-low",
+                type=float,
+                default=0,
+                help="Lower-side epsilon for SAO DIS; the lower ratio bound is 1 - dis_clip_low.",
             )
             parser.add_argument(
                 "--custom-tis-function-path",
@@ -1620,8 +1811,13 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         role_args.use_opd = False
         role_args.custom_advantage_function_path = None
         role_args.untie_embeddings_and_output_weights = True
+        role_args.freeze_params_name_list = base_args.critic_freeze_params_name_list
+        if getattr(base_args, "critic_lr", None) is not None:
+            role_args.lr = base_args.critic_lr
         if "disable_param_buffers_cpu_backup" not in overrides:
             role_args.disable_param_buffers_cpu_backup = False
+
+        print(f'role:{role}, critic_args:{role_args}')
 
     return role_args
 
@@ -1791,6 +1987,39 @@ def slime_validate_args(args):
         assert args.save is not None, "'--save' is required when save_interval is set."
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
+    if args.overlong_reward_coef < 0:
+        raise ValueError("--overlong-reward-coef must be non-negative.")
+    if not 0 <= args.overlong_reward_threshold_ratio < 1:
+        raise ValueError("--overlong-reward-threshold-ratio must be in [0, 1).")
+    if args.overlong_reward_max_penalty < 0:
+        raise ValueError("--overlong-reward-max-penalty must be non-negative.")
+    if args.overlong_reward_max_len is not None and args.overlong_reward_max_len <= 0:
+        raise ValueError("--overlong-reward-max-len must be positive when set.")
+    if args.answer_format_reward_coef < 0:
+        raise ValueError("--answer-format-reward-coef must be non-negative.")
+    if args.tool_call_format_reward_coef < 0:
+        raise ValueError("--tool-call-format-reward-coef must be non-negative.")
+    if args.value_loss_type == "classification":
+        if args.value_num_bins < 2:
+            raise ValueError("--value-num-bins must be >= 2 when --value-loss-type classification.")
+        if args.value_reward_range[0] >= args.value_reward_range[1]:
+            raise ValueError("--value-reward-range must satisfy LOW < HIGH when --value-loss-type classification.")
+        if args.hl_gauss_sigma_ratio <= 0:
+            raise ValueError("--hl-gauss-sigma-ratio must be positive when --value-loss-type classification.")
+    if args.compaction_max_context_len is not None and args.compaction_max_context_len <= 0:
+        raise ValueError("--compaction-max-context-len must be positive when set.")
+    if args.compaction_trigger_len <= 0:
+        raise ValueError("--compaction-trigger-len must be positive.")
+    if args.compaction_max_count < 0:
+        raise ValueError("--compaction-max-count must be non-negative.")
+    if args.compaction_recent_steps < 0:
+        raise ValueError("--compaction-recent-steps must be non-negative.")
+    if args.compaction_summary_max_new_tokens <= 0:
+        raise ValueError("--compaction-summary-max-new-tokens must be positive.")
+    if args.enable_compaction_rl and args.advantage_estimator != "ppo":
+        raise ValueError("CompactionRL currently requires --advantage-estimator ppo.")
+    if args.enable_compaction_rl and args.rollout_top_p != 1.0:
+        raise ValueError("CompactionRL currently requires --rollout-top-p 1.0.")
 
     if args.advantage_estimator in ["reinforce_plus_plus", "reinforce_plus_plus_baseline"]:
         assert args.normalize_advantages, (
@@ -1800,6 +2029,12 @@ def slime_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+        assert not args.use_dis, "use_rollout_logprobs and use_dis cannot be set at the same time."
+    assert not (args.use_tis and args.use_dis), "use_tis and use_dis cannot be set at the same time."
+    if args.dis_clip < 0:
+        raise ValueError("--dis-clip must be non-negative.")
+    if args.dis_clip_low < 0:
+        raise ValueError("--dis-clip-low must be non-negative.")
 
     if args.get_mismatch_metrics:
         assert (

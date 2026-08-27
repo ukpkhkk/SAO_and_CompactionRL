@@ -1,9 +1,14 @@
+import logging
+from collections import OrderedDict
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from slime.utils import logging_utils
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+from slime.utils.types import Sample
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -28,6 +33,8 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    if args.eval_interval is not None and args.start_rollout_id == 0 and not args.skip_eval_before_train:
+        ray.get(rollout_manager.eval.remote(rollout_id=0))
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
@@ -44,7 +51,21 @@ def train(args):
 
         actor_trains = (not args.use_critic) or rollout_id >= args.num_critic_only_steps
         if args.use_critic:
-            value_refs = critic_model.async_train(rollout_id, rollout_data_curr_ref)
+            K = getattr(args, "critic_update_ratio", 1)
+            value_refs = None
+            # -----------------------------
+            # Critic 更新 K 次
+            # -----------------------------
+            for _ in range(K):
+                value_refs = critic_model.async_train(
+                    rollout_id,
+                    rollout_data_curr_ref,
+                )
+                # 等待本次 critic 更新完成
+                ray.get(value_refs)
+            # -----------------------------
+            # Actor 更新 1 次
+            # -----------------------------
             if actor_trains:
                 ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref, external_data=value_refs))
             else:
@@ -63,7 +84,7 @@ def train(args):
             if args.rollout_global_dataset:
                 ray.get(rollout_manager.save.remote(rollout_id))
 
-        if release_train or (rollout_id + 1) % args.update_weights_interval == 0:
+        if actor_trains and (release_train or (rollout_id + 1) % args.update_weights_interval == 0):
             # sync generate before update weights to prevent update weight in the middle of generation
             rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
             rollout_data_next_future = None

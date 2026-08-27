@@ -986,6 +986,11 @@ def initialize_model_and_optimizer(
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+    
+    # print(f'role:{role}, role_args:{args}')
+    if args.use_critic and role == 'critic':
+        # if critic-freeze-params-name-list
+        args.freeze_params_list = args.critic_freeze_params_name_list
 
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
     model[0].role = role
@@ -998,6 +1003,7 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
+    print(f'role:{role}, reinit_critic_output_layer:{reinit_critic_output_layer}')
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(args, model)
         if (args.fp16 or args.bf16) and optimizer is not None:

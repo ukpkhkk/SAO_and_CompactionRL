@@ -1,0 +1,16 @@
+# megatron:
+#   - name: default
+#     role: critic
+#     overrides: 
+#       lr: 1e-5
+#   - name: default
+#     role: actor
+#     overrides:
+#       lr: 1e-6
+megatron:
+  - name: default
+    role: critic
+    overrides: {}
+  - name: default
+    role: actor
+    overrides: {}

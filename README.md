@@ -1,203 +1,374 @@
-# slime
+# Agentic RL on Slime
 
-[中文版](./README_zh.md)
+[中文文档](README_zh.md) | English
 
-[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)
-[![CI](https://img.shields.io/github/actions/workflow/status/THUDM/slime/pr-test.yml?branch=zilin%2Fci-dont-merge&event=pull_request&label=CI&logo=github)](https://github.com/THUDM/slime/pull/2053/checks)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/THUDM/slime)
+This repository is a research fork of [slime](https://github.com/THUDM/slime) for long-horizon LLM reinforcement learning. It keeps the Megatron + SGLang training stack from slime and adds the pieces needed for agentic RL experiments:
 
-**slime** is an LLM post-training framework for RL scaling, providing two core capabilities:
+- Windowed FIFO asynchronous rollout/training.
+- Vanilla GRPO baseline.
+- PPO/SAO with a critic, GAE, DIS, and optional critic pretraining.
+- Regression-as-classification critic loss.
+- Retool-style tool-integrated reasoning with Python sandbox rewards.
+- Rollout/eval JSONL logging and TensorBoard metrics.
 
-1.  **High-Performance Training**: Supports efficient training in various modes by connecting Megatron with SGLang;
-2.  **Flexible Data Generation**: Enables arbitrary training data generation workflows through custom data generation interfaces and server-based engines.
+The current scripts are written for Qwen3-4B TIR experiments and are intended to be edited in place for your model/data paths.
 
-slime's design goal is to make these two capabilities reinforce each other without turning the system into a heavy stack of disconnected trainers, rollout services, and agent frameworks. Megatron training, SGLang rollout, custom data generation, reward computation, verifier feedback, and environment interaction all flow through the same training / rollout / Data Buffer path.
+## What Is Implemented
 
-This makes slime one of the most battle-tested open RL post-training frameworks: small enough to understand and extend, but validated through complete training loops behind SOTA-level model releases.
+| Component | Description |
+| --- | --- |
+| Async pipeline | `train_async.py` with `slime.rollout.fully_async_rollout.generate_rollout_fully_async` implements Windowed FIFO rollout. |
+| Vanilla GRPO | Async GRPO baseline with grouped sampling. |
+| SAO | Single-rollout PPO with critic baseline, length-adaptive GAE, skip-observation GAE, and DIS. |
+| Critic pretraining | Critic-only training before SAO, using the same rollout/reward path as RL. |
+| Classification critic | `--value-loss-type classification` supports two-hot / HL-Gauss targets. |
+| Vanilla PPO | Synchronous colocated PPO entry through `train.py`. |
+| Retool TIR | Tool-calling rollout with Python interpreter, answer-format reward, and tool-call-format reward. |
 
-## Why This Design Matters
+## Results
 
-- **Battle-tested by frontier model training**: slime is the RL framework behind [GLM-5.2](https://z.ai/blog/glm-5.2), [GLM-5.1](https://z.ai/blog/glm-5.1), [GLM-5](https://z.ai/blog/glm-5), [GLM-4.7](https://z.ai/blog/glm-4.7), [GLM-4.6](https://z.ai/blog/glm-4.6), and [GLM-4.5](https://z.ai/blog/glm-4.5). This validates the full post-training loop, not only isolated examples.
-- **Correctness-first infrastructure**: RL bugs are often silent. slime keeps the dataflow explicit, supports separate rollout-only and train-only debugging paths, and documents reproducibility, fault tolerance, tracing, profiling, and CI as first-class engineering concerns.
-- **Native by design**: slime passes Megatron arguments through directly and exposes installed SGLang arguments with a `--sglang-` prefix. New upstream training and serving optimizations can be used without adding another abstraction layer inside slime.
-- **Maximum data-generation freedom**: math, code, search, tools, sandboxes, verifiers, environments, multi-agent systems, and long-horizon agentic workflows plug in as data generation or reward workflows. They do not fork the training kernel.
-- **Lightweight and opinionated**: slime focuses deeply on the Megatron + SGLang path used for large-scale RL. By choosing one rollout backend, slime can use SGLang-specific capabilities directly instead of flattening multiple inference engines into a lowest-common-denominator abstraction.
+Representative metrics are shown below. For full training curves, use the TensorBoard logs produced by each script.
 
-## Production Validation
-
-slime has been exercised by the complete workflow needed for release-grade model post-training: large-scale training, high-throughput rollout, weight synchronization, reward/verifier data, checkpointing, debugging, and long-running stability.
-
-Beyond the GLM family, slime also supports:
-
-- Qwen series: Qwen3.6, Qwen3.5, Qwen3Next, Qwen3MoE, Qwen3, Qwen2.5;
-- DeepSeek V3 series: DeepSeek V3, V3.1, DeepSeek R1;
-- Llama 3.
-
-## Native Engine Pass-Through and SGLang Deployment
-
-slime is not just a framework that can call an inference backend. It keeps the Megatron and SGLang control surfaces close to the upstream engines while adding the RL dataflow around them:
-
-- native SGLang argument pass-through: every argument supported by the installed SGLang can be used by adding the `--sglang-` prefix, such as passing `--mem-fraction-static` as `--sglang-mem-fraction-static`;
-- native Megatron argument pass-through: slime reads Megatron arguments directly, so Megatron-side parallelism, optimizer, checkpointing, and model options remain available without wrapper code;
-- [SGLang Config](docs/en/advanced/sglang-config.md) as an optional YAML extension for topology-specific control, such as separate prefill/decode/EPD-style settings, heterogeneous server groups, multi-model serving, and per-group SGLang overrides;
-- [PD Disaggregation](docs/en/advanced/pd-disaggregation.md) for multi-turn and agentic workloads with different prefill/decode resource needs;
-- router policies such as session affinity for multi-turn agents;
-- [Delta Weight Sync](docs/en/advanced/delta-weight-sync.md) for training/inference disaggregation and large-model update efficiency;
-- [External Rollout Engines](docs/en/advanced/external-rollout-engines.md) for deployments where serving is managed outside the training job. The SGLang serving side can use an independent environment, and with disk transport can even run on different GPU models or vendors while using full-checkpoint update from disk or delta update over a shared filesystem.
-
-This pass-through design makes slime native from the start. Most upstream engine improvements remain accessible as the engines evolve, while slime focuses on the RL loop, dataflow, synchronization, and correctness checks.
-
-Choosing SGLang as the single rollout backend is also intentional. Multi-backend frameworks often have to abstract over the common subset of several inference engines, which can hide the strongest features of each backend. slime instead optimizes deeply for SGLang so RL workloads can use SGLang-specific serving, routing, caching, disaggregation, and weight-sync behavior directly.
-
-## Correctness, Stability, and CI
-
-slime is developed as RL infrastructure, where "the script runs" is not enough. The project maintains CPU unit tests, contract tests for customization hooks, and GPU end-to-end tests covering dense and MoE models, Megatron training paths, SGLang deployment configurations, checkpointing, numerical precision, async rollout, OPD, PPO-style workflows, and debug rollout-then-train replay.
-
-Useful engineering docs:
-
-- [CI](docs/en/developer_guide/ci.md)
-- [Debugging](docs/en/developer_guide/debug.md)
-- [Reproducibility](docs/en/advanced/reproducibility.md)
-- [Fault Tolerance](docs/en/advanced/fault-tolerance.md)
-- [Trace Viewer](docs/en/developer_guide/trace.md)
-- [Profiling](docs/en/developer_guide/profiling.md)
-
-## Blogs
-
-- Our vision: [slime: An SGLang-Native Post-Training Framework for RL Scaling](https://lmsys.org/blog/2025-07-09-slime/).
-- Our ideas on agentic training: [Agent-Oriented Design: An Asynchronous and Decoupled Framework for Agentic RL](https://www.notion.so/Agent-Oriented-Design-An-Asynchronous-and-Decoupled-Framework-for-Agentic-RL-2278e692d081802cbdd5d37cef76a547)
-- v0.1.0 release note: [v0.1.0: Redefining High-Performance RL Training Frameworks](https://thudm.github.io/slime/blogs/release_v0.1.0.html)
-
-## Table of Contents
-
-- [Why This Design Matters](#why-this-design-matters)
-- [Production Validation](#production-validation)
-- [Native Engine Pass-Through and SGLang Deployment](#native-engine-pass-through-and-sglang-deployment)
-- [Correctness, Stability, and CI](#correctness-stability-and-ci)
-- [Architecture Overview](#architecture-overview)
-- [Quick Start](#quick-start)
-- [Ecosystem Built on slime](#ecosystem-built-on-slime)
-- [Arguments Walkthrough](#arguments-walkthrough)
-- [Developer Guide](#developer-guide)
-- [FAQ & Acknowledgements](#faq--acknowledgements)
-
-## Architecture Overview
-
-![arch](./imgs/arch.png)
-
-**Module Descriptions**:
-
-- **training (Megatron)**: Responsible for the main training process, reads data from the Data Buffer, and synchronizes parameters to the rollout module after training.
-- **rollout (SGLang + router)**: Generates new data (including rewards/verifier outputs) and stores it in the Data Buffer. Custom generate functions can wrap this with multi-turn loops, tool calls, environment/sandbox interaction, and verifier-based reward.
-- **data buffer**: A bridge module that manages prompt initialization, custom data, and rollout generation methods (including agentic workflows that produce samples through the same interface).
+<p align="center">
+  <img src="imgs/metrics.png" alt="training metrics" width="900">
+</p>
 
 ## Quick Start
 
-For a comprehensive quick start guide covering environment setup, data preparation, training startup, and key code analysis, please refer to:
-- [Quick Start Guide](./docs/en/get_started/quick_start.md)
+### 1. Prepare the Environment
 
-We also provide examples for some use cases not covered in the quick start guide; please check [examples](examples/).
-
-### Agentic RL examples
-
-For agentic RL workloads, the following examples plug into the standard rollout / Data Buffer loop through customization interfaces — they are not separate frameworks:
-
-- [`examples/multi_agent`](examples/multi_agent/README.md): Multi-agent rollout via a custom `--rollout-function-path`.
-- [`examples/search-r1`](examples/search-r1/): Search/RAG-style multi-turn generation via `--custom-generate-function-path`.
-- [`examples/fully_async`](examples/fully_async/README.md): Fully-async rollout, useful for long-tail agentic generation where some samples take much longer than others.
-- [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md): End-to-end SWE coding-agent RL with sandboxed tool use, test-based rewards, and token-correct trajectory segments via `--custom-generate-function-path`.
-
-See the [Customization Guide](docs/en/get_started/customization.md) for which interface to use for a given agentic workflow.
-
-## Ecosystem Built on slime
-
-These are not just demos. They are independent systems that use slime as a reusable RL substrate for production-scale post-training, agentic RL, domain RL, and rollout-system research.
-
-### 🐎 Dressage: Scalable RL for Any Agent and Sandbox
-
-[**Dressage**](https://github.com/Accio-Lab/Dressage) is an agentic RL training framework built on slime by [Alibaba Accio](https://www.accio.com/work?im_ref=1O8wgT3poxyZWCj31F1ZJ0fNUkuTK6x9ZTHw0Y0&sharedid=&im_pid=5619512&im_pname=AI%20INTRO%20COPORATE), centered on unified RL for blackbox agents (e.g., [OpenCode](https://github.com/anomalyco/opencode), [OpenClaw](https://github.com/openclaw/openclaw)) and white loops across any sandbox environment (e.g., [bwrap](https://github.com/containers/bubblewrap), [E2B](https://github.com/e2b-dev/e2b), Kubernetes). It decouples interaction semantics, execution placement, and token-level trajectory capture through Paddock, Sandbox, and Proxy layers, adapting agent workflows without rewriting their internal loops. Dressage records token-wise logprobs, loss masks, weight versions, and MoE routing, then uses TITO and segment-aware training to turn long-horizon tool interactions into stable RL samples.
-
-### ⛵ Miles: Enterprise-Grade Reinforcement Learning for Large-Scale Model Training
-
-[Miles](https://github.com/radixark/miles) is an RL post-training framework for large-scale models, built on slime by [RadixArk](https://github.com/radixark). It stays closely aligned with slime's upstream development while extending it with enterprise-oriented features: deeper [SGLang](https://github.com/sgl-project/sglang) integration, operational tooling, deployment support, and optimizations for new [models](https://www.radixark.com/miles/docs/models) and [hardware](https://www.radixark.com/miles/docs/platforms). Miles also adds a growing set of production features, including LoRA, TITO, and low-precision training.
-
-### 🔷 vime: vLLM-Native RL Post-Training Built on slime
-
-[**vime**](https://github.com/vllm-project/vime) is a post-training framework built on slime and maintained by the vLLM project. It keeps slime's Megatron training stack, Data Buffer dataflow, and custom data-generation design, with its main change being a rollout backend swapped to [**vLLM**](https://github.com/vllm-project/vllm) with [vllm-router](https://github.com/vllm-project/router). Starting from an existing slime launch script, adjusting only rollout-related parameters is enough to quickly run training with vime.
-
-### 🌈 Relax: Asynchronous RL Engine for Omni-Modal Agentic Training
-
-[**Relax**](https://github.com/redai-infra/Relax) (Reinforcement Engine Leveraging Agentic X-modality) is an omni-modal agentic RL framework open-sourced by the RedAI Infra team, built upon the slime infrastructure stack that combines Ray, Megatron-LM, and SGLang. Relax adopts a service-oriented architecture on Ray Serve with Megatron-LM and SGLang as training/inference backends. It uses [TransferQueue](https://github.com/Ascend/TransferQueue) to fully decouple Actor, Rollout, ActorFwd, Reference, and Advantage computation onto independent GPU clusters, and introduces **DCS (Distributed Checkpoint Service)** — an NCCL-broadcast weight-sync engine that streams updated Actor weights to Rollout/ActorFwd/Reference asynchronously and overlaps the transfer with the next training step, enabling fully-async training at configurable staleness. Relax supports end-to-end RL for text, vision, and audio (including Qwen3-Omni) and agentic multi-turn rollouts.
-
-### 🦞 OpenClaw-RL: Train a Personalized Clawbot Simply by Talking to It
-
-[**OpenClaw-RL**](https://github.com/Gen-Verse/OpenClaw-RL) is an RL server for personalized OpenClaw agents. It hosts the OpenClaw model and improves it from prior conversations across deployments, while slime's asynchronous RL infrastructure prevents training from interfering with API serving. It supports two automatic optimization methods: GRPO with binary feedback inferred from subsequent states, and on-policy distillation that extracts hindsight hints from later feedback for the current policy.
-
-### ⚛️ P1: Mastering Physics Olympiads with Reinforcement Learning
-
-[**P1**](https://prime-rl.github.io/P1/) is a family of open-source physics reasoning models trained entirely through reinforcement learning. P1 leverages slime as the RL post-training framework, and introduces a multi-stage RL training algorithm that progressively enhances reasoning ability through adaptive learnability adjustment and stabilization mechanisms. Empowered by this training paradigm, P1 delivers breakthrough performance in open-source physics reasoning.
-
-### 📈RLVE: Scaling LM RL with Adaptive Verifiable Environments
-
-[**RLVE**](https://github.com/Zhiyuan-Zeng/RLVE) introduces an approach using verifiable environments that procedurally generate problems and provide algorithmically verifiable rewards, to scale up RL for language models (LMs). With joint training across 400 verifiable environments, RLVE enables each environment to dynamically adapt its problem difficulty distribution to the policy model's capabilities as training progresses.
-
-### ⚡ TritonForge: Agentic RL Training Framework for Kernel Generation
-
-[**TritonForge**](https://github.com/RLsys-Foundation/TritonForge) leverages slime's SFT and RL capabilities to train LLMs that automatically generate optimized GPU kernels. By using a two-stage training approach—supervised fine-tuning followed by reinforcement learning with multi-turn compilation feedback—TritonForge achieves remarkable results in converting PyTorch operations into high-performance Triton kernels.
-
-### 🚀 APRIL: Accelerating RL Training with Active Partial Rollouts
-
-[**APRIL**](https://github.com/RLsys-Foundation/APRIL) introduces a system-level optimization that seamlessly integrates with slime to accelerate the rollout generation phase in RL training. By intelligently over-provisioning requests and actively managing partial completions, APRIL addresses the long-tail generation bottleneck that typically consumes over 90% of RL training time.
-
-### 🏟️ qqr: Scaling Open-Ended Agents with ArenaRL & MCP
-
-[**qqr**](https://github.com/Alibaba-NLP/qqr) (a.k.a. hilichurl) is a lightweight extension for slime designed to evolve open-ended agents. It implements the **ArenaRL** algorithm to tackle discriminative collapse through tournament-based relative ranking (**e.g., Seeded Single-Elimination, Round-Robin**) and seamlessly integrates the **Model Context Protocol (MCP)**. qqr leverages slime's high-throughput training capabilities to enable scalable, distributed evolution of agents in standardized, decoupled tool environments.
-
-### ☁️ ART: Scalable and Sandboxed Agentic RL on AWS Bedrock AgentCore Runtime
-
-[**ART (AgentCore RL Toolkit)**](https://github.com/awslabs/agentcore-rl-toolkit) is an SDK that adapts production agents for RL training on **AWS Bedrock AgentCore Runtime**. AgentCore Runtime provides auto-scaled and sandboxed agent execution environments well-suited for running many parallel agent rollouts securely. Using ART, user only needs to apply a decorator (`@app.rollout_entrypoint`) to their agent codes for RL adaption while the same production agent harness is reused directly, where token capture for RL is handled at model gateway layer. ART uses slime as one option of training backends, enabling users to easily optimizing the production agent model with RL training algorithms in slime.
-
-Together, these projects show the main idea behind slime: one high-performance RL kernel can support frontier model post-training, online agent optimization, verifiable environments, omni-modal rollouts, kernel-generation agents, and rollout-system research without changing the core training loop.
-
-## Arguments Walkthrough
-
-Arguments in slime are divided into three categories:
-
-1.  **Megatron arguments**: slime reads Megatron arguments directly. You can configure Megatron by passing arguments like `--tensor-model-parallel-size 2`.
-2.  **SGLang arguments**: All arguments for the installed SGLang are supported through pass-through. These arguments must be prefixed with `--sglang-`. For example, `--mem-fraction-static` should be passed as `--sglang-mem-fraction-static`.
-3.  **slime-specific arguments**: Please refer to: [slime/utils/arguments.py](slime/utils/arguments.py)
-
-For complete usage instructions, please refer to the [Usage Documentation](docs/en/get_started/usage.md).
-
-## Developer Guide
-
-- **Contributions are welcome\!** If you have suggestions for new features, performance tuning, or feedback on user experience, feel free to submit an Issue or PR 😊
-
-- Use [pre-commit](https://pre-commit.com/) to ensure code style consistency for your commits:
+The training stack expects Linux, CUDA GPUs, Megatron-LM, SGLang, Ray, and Python 3.12. The recommended setup is the repository conda build script:
 
 ```bash
-apt install pre-commit -y
-pre-commit install
-
-# run pre-commit to ensure code style consistency
-pre-commit run --all-files --show-diff-on-failure --color=always
+bash build_conda.sh
+source ~/.bashrc
+micromamba activate slime
+cd /path/to/this/repo
+pip install -e . --no-deps
 ```
 
-- For debugging tips, please refer to the [Debugging Guide](docs/en/developer_guide/debug.md)
+If your server cannot access GitHub or Docker Hub, prepare third-party source archives under `third_party/` and use the offline build workflow in `my_build_conda.sh` if present in your checkout.
 
-## FAQ & Acknowledgements
+`build_conda.sh` is primarily a dependency bootstrap script. Before running experiments, make sure the editable `slime` package points to this modified repository, not a fresh upstream clone.
 
-- For frequently asked questions, please see the [Q\&A](docs/en/get_started/qa.md)
-- Special thanks to the following projects & communities: SGLang, Megatron‑LM, mbridge, OpenRLHF, veRL, Pai-Megatron-Patch and others.
-- To quote slime, please use:
+Before launching training, verify the key imports:
 
-```bibtex
-@misc{slime_github,
-  author       = {Zilin Zhu and Chengxing Xie and Xin Lv and slime Contributors},
-  title        = {slime: An LLM post-training framework for RL Scaling},
-  year         = {2025},
-  howpublished = {\url{https://github.com/THUDM/slime}},
-  note         = {GitHub repository. Corresponding author: Xin Lv},
-  urldate      = {2025-06-19}
-}
+```bash
+python -c "import ray, sglang, torch, slime; print('env ok')"
 ```
+
+### 2. Prepare Model Checkpoints
+
+Each experiment script expects both a HuggingFace checkpoint and a Megatron torch distributed checkpoint:
+
+```text
+MODEL_DIR=/path/to/qwen3-4b-sft
+MODEL_DIR_torch_dist=/path/to/qwen3-4b-sft_torch_dist
+```
+
+The HuggingFace directory should contain files such as:
+
+```text
+config.json
+tokenizer.json / tokenizer.model
+tokenizer_config.json
+generation_config.json
+```
+
+The torch distributed directory should contain Megatron checkpoint metadata, including:
+
+```text
+latest_checkpointed_iteration.txt
+iter_*/ or release/
+```
+
+The provided Qwen3-4B scripts currently use:
+
+```bash
+MODEL_DIR="/mnt/workspace/models/font-info/qwen3-4b-sft"
+```
+
+Edit this path before running.
+
+### 3. Prepare Data
+
+The Retool/TIR scripts expect JSONL data with at least:
+
+```json
+{"prompt": "...", "label": "..."}
+```
+
+The default paths in the scripts are:
+
+```bash
+DATA_DIR="/mnt/workspace/public/data/RLdata/tir"
+TRAIN_DATA="${DATA_DIR}/tir_train_data/dapo-math-17k.jsonl"
+EVAL_DATA="${DATA_DIR}/tir_val_data/aime-2024.jsonl"
+```
+
+Update `PROJECT_DIR`, `DATA_DIR`, `MODEL_DIR`, and `LOG_DIR` near the top of each script before launching.
+
+### 4. Reproduce Async GRPO
+
+Entry script:
+
+```bash
+scripts/run-qwen3-4B-grpo.sh
+```
+
+This script runs:
+
+- entry: `train_async.py`
+- algorithm: `--advantage-estimator grpo`
+- async rollout: Windowed FIFO
+- train GPUs: 4
+- rollout GPUs: 4
+- rollout group: `--rollout-batch-size 8` and `--n-samples-per-prompt 8`
+- global batch size: 64
+
+Run:
+
+```bash
+ray stop --force || true
+bash scripts/run-qwen3-4B-grpo.sh
+```
+
+Main outputs:
+
+```text
+qwen3_4b_grpo_checkpoints/
+  checkpoints/<exp_name>/
+  tensorboards/<exp_name>/
+  <exp_name>/rollout_log/
+```
+
+Useful parameters to edit:
+
+```bash
+--num-rollout
+--global-batch-size
+--rollout-batch-size
+--n-samples-per-prompt
+--rollout-max-response-len
+--sglang-server-concurrency
+--windowed-fifo-max-delay-step
+--windowed-fifo-max-prefetch-steps
+```
+
+### 5. Reproduce Async SAO with Critic Pretraining
+
+SAO is a two-stage workflow:
+
+1. Pretrain the critic.
+2. Run PPO/SAO initialized from the pretrained critic.
+
+#### Stage A: critic pretraining
+
+Entry script:
+
+```bash
+scripts/sao-critic-pretrain.sh
+```
+
+This script runs:
+
+- entry: `train_async.py`
+- actor learning rate: 0
+- critic-only steps: all rollout steps
+- value loss: classification critic with HL-Gauss targets
+- train GPUs: 4
+- rollout GPUs: 4
+- output critic checkpoint:
+
+```text
+qwen3_4b_checkpoints/checkpoints/sao-classify-pretrained-critic/critic
+```
+
+Run:
+
+```bash
+ray stop --force || true
+bash scripts/sao-critic-pretrain.sh
+```
+
+#### Stage B: SAO training
+
+Entry script:
+
+```bash
+scripts/run-qwen3-4B-sao-fifo.sh
+```
+
+This script runs:
+
+- entry: `train_async.py`
+- algorithm: `--advantage-estimator ppo`
+- async rollout: Windowed FIFO
+- single rollout per prompt: `--n-samples-per-prompt 1`
+- critic baseline: enabled
+- DIS: `--use-dis`
+- length-adaptive GAE: `--enable-length-adaptive`
+- skip observation GAE: `--skip-observation-gae`
+- classification critic: `--value-loss-type classification`
+- pretrained critic path:
+
+```bash
+PRETRAINED_CRITIC_DIR="${LOG_DIR}/checkpoints/sao-classify-pretrained-critic/critic"
+```
+
+Run:
+
+```bash
+ray stop --force || true
+bash scripts/run-qwen3-4B-sao-fifo.sh
+```
+
+Main outputs:
+
+```text
+qwen3_4b_checkpoints/
+  checkpoints/<exp_name>/actor/
+  checkpoints/<exp_name>/critic/
+  tensorboards/<exp_name>/
+  <exp_name>/rollout_log/
+```
+
+Resume behavior:
+
+- If both `actor/latest_checkpointed_iteration.txt` and `critic/latest_checkpointed_iteration.txt` exist, the script resumes from them.
+- If only one side exists, the script exits to avoid loading mismatched actor/critic state.
+- If neither exists, actor starts from `${MODEL_DIR}_torch_dist` and critic starts from `PRETRAINED_CRITIC_DIR`.
+
+Important SAO parameters:
+
+```bash
+--use-dis
+--dis-clip
+--dis-clip-low
+--critic-lr
+--critic-update-ratio
+--critic-freeze-params-name-list
+--value-loss-type classification
+--value-num-bins
+--value-reward-range
+--value-target-type hl_gauss
+--hl-gauss-sigma-ratio
+--update-weights-interval
+```
+
+### 6. Reproduce Vanilla PPO
+
+Entry script:
+
+```bash
+scripts/run-qwen3-4B-vanillappo.sh
+```
+
+This script runs:
+
+- entry: `train.py`
+- algorithm: `--advantage-estimator ppo`
+- synchronous rollout/train flow
+- colocated training and rollout: `--colocate`
+- actor GPUs: 8
+- rollout batch size: 32
+- global batch size: 32
+
+Run:
+
+```bash
+ray stop --force || true
+bash scripts/run-qwen3-4B-vanillappo.sh
+```
+
+Main outputs:
+
+```text
+qwen3_4b_vanillappo_checkpoints/
+  checkpoints/<exp_name>/
+  <exp_name>/tensorboards/
+  <exp_name>/rollout_log/
+```
+
+Vanilla PPO is the right baseline when you want the synchronous PPO behavior without the Windowed FIFO asynchronous pipeline.
+
+### 7. Monitor Training
+
+Start TensorBoard from the project root:
+
+```bash
+tensorboard --logdir qwen3_4b_checkpoints/tensorboards --host 0.0.0.0 --port 6006
+```
+
+For vanilla PPO:
+
+```bash
+tensorboard --logdir qwen3_4b_vanillappo_checkpoints --host 0.0.0.0 --port 6006
+```
+
+For GRPO:
+
+```bash
+tensorboard --logdir qwen3_4b_grpo_checkpoints/tensorboards --host 0.0.0.0 --port 6006
+```
+
+Useful TensorBoard groups:
+
+| Group | What to check |
+| --- | --- |
+| `train/*` | PPO/GRPO loss, policy loss, entropy, critic loss, DIS/TIS metrics. |
+| `rollout/*` | reward, response length, tool call count, KL, staleness, queue behavior. |
+| `eval/*` | eval reward/accuracy and eval rollout statistics. |
+| `perf/*` | rollout time, actor train time, logprob time, token throughput. |
+
+Rollout text logs are written as JSONL:
+
+```text
+<LOG_DIR>/<EXP_NAME>/rollout_log/rollout_outputs/rollout_<step>.jsonl
+<LOG_DIR>/<EXP_NAME>/rollout_log/eval_outputs/eval_<dataset>_<step>.jsonl
+```
+
+These files are the fastest way to inspect tool calls, final answer parsing, reward fields, truncation, and compaction metadata.
+
+## Script Reference
+
+| Experiment | Script | Entry | Notes |
+| --- | --- | --- | --- |
+| Async GRPO | `scripts/run-qwen3-4B-grpo.sh` | `train_async.py` | Windowed FIFO, grouped sampling. |
+| Critic pretrain | `scripts/sao-critic-pretrain.sh` | `train_async.py` | Critic-only training, classification value loss. |
+| Async SAO | `scripts/run-qwen3-4B-sao-fifo.sh` | `train_async.py` | PPO + critic + DIS + Windowed FIFO. |
+| Vanilla PPO | `scripts/run-qwen3-4B-vanillappo.sh` | `train.py` | Synchronous colocated PPO baseline. |
+| Checkpoint eval | `scripts/eval-qwen3-4B-vanillappo-checkpoint.sh` | `train.py` | Eval-only checkpoint inference. |
+| SFT sanity check | `scripts/debug-infer-qwen3-4B-sft.sh` | `train.py` | Verifies SFT checkpoint generation. |
+
+## Running on DLC or Multi-Node Ray
+
+For managed jobs, use `scripts/ray.sh` as the outer launcher and select the actual training script through `SCRIPTS`:
+
+```bash
+export WORK_DIR=/mnt/workspace/wangdy/code/zj-slime-0722
+export NNODES=1
+export N_GPUS_PER_NODE=8
+export SCRIPTS=run-qwen3-4B-sao-fifo.sh
+export EXP_NAME=sao-classify-critic-pretrain
+
+bash /mnt/workspace/wangdy/code/zj-slime-0722/scripts/ray.sh
+tail -f /dev/null
+```
+
+`ray.sh` reads `WORK_DIR` from the environment, starts or joins the Ray cluster, and launches `${SCRIPTS}` from the project scripts directory.
+
+## Notes and Common Pitfalls
+
+- Always edit hard-coded `PROJECT_DIR`, `DATA_DIR`, `MODEL_DIR`, and `LOG_DIR` before running.
+- The HuggingFace checkpoint and `${MODEL_DIR}_torch_dist` checkpoint must match.
+- Classification critic checkpoints are not compatible with MSE critic heads unless the value head is reinitialized intentionally.
+- For SAO resume, actor and critic checkpoint steps must match.
+- `--rollout-max-response-len` controls rollout generation length/context budget in the Retool rollout.
+- `--max-tokens-per-gpu` controls Megatron dynamic batching capacity per GPU, not the SGLang KV cache size.
+- If SGLang reports KV cache pressure, reduce `--sglang-server-concurrency`, reduce max response length, or increase rollout GPU memory fraction.
+- If Ray job submission fails because an old cluster is still running, run `ray stop --force` before restarting.
+
+## Acknowledgement
+
+This work builds on the original slime training framework and its Megatron + SGLang integration. The added experiment scripts and training logic are focused on reproducible agentic RL experiments with GRPO, PPO, SAO, critic pretraining, and classification value losses.

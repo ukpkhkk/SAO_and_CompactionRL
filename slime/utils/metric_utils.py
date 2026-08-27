@@ -65,6 +65,15 @@ def compute_statistics(values: list[float]) -> dict[str, float]:
         "min": np.min(values).item(),
     }
 
+def compute_statistics_with_staleness(values: list[float]) -> dict[str, float]:
+    values = np.array(values)
+    return {
+        "mean": np.mean(values).item(),
+        "median": np.median(values).item(),
+        "max": np.max(values).item(),
+        "min": np.min(values).item(),
+        "staleness": (np.sum(np.array(values) > 0) / len(values)).item()
+    }
 
 def compression_ratio(
     data: str | bytes,

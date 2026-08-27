@@ -21,6 +21,12 @@ from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
 
+def _value_head_output_size(args: argparse.Namespace) -> int:
+    if getattr(args, "value_loss_type", "mse") == "classification":
+        return getattr(args, "value_num_bins", 2)
+    return 1
+
+
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
     def __init__(
@@ -78,7 +84,9 @@ def _get_model_provider_func(
             # Apply critic output layer if needed
             if post_process and role == "critic":
                 model.output_layer = LinearForLastLayer(
-                    input_size=model.config.hidden_size, output_size=1, config=model.config
+                    input_size=model.config.hidden_size,
+                    output_size=_value_head_output_size(args),
+                    config=model.config,
                 )
             return model
 
@@ -114,7 +122,9 @@ def _get_model_provider_func(
                 model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
                 if post_process:
                     model.output_layer = LinearForLastLayer(
-                        input_size=model.config.hidden_size, output_size=1, config=model.config
+                        input_size=model.config.hidden_size,
+                        output_size=_value_head_output_size(args),
+                        config=model.config,
                     )
                 return model
 
@@ -151,7 +161,9 @@ def _get_model_provider_func(
                     model = result(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
                     if post_process and role == "critic":
                         model.output_layer = LinearForLastLayer(
-                            input_size=config.hidden_size, output_size=1, config=config
+                            input_size=config.hidden_size,
+                            output_size=_value_head_output_size(args),
+                            config=config,
                         )
                     return model
                 transformer_layer_spec = result
@@ -235,7 +247,11 @@ def _get_model_provider_func(
             model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
-            model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+            model.output_layer = LinearForLastLayer(
+                input_size=config.hidden_size,
+                output_size=_value_head_output_size(args),
+                config=config,
+            )
 
         return model
 

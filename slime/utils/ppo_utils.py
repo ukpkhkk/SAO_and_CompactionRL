@@ -468,7 +468,295 @@ def get_reinforce_plus_plus_baseline_advantages(
     return unwhitened_advantages
 
 
+def single_sequence_gae_with_skip_obs(
+    rewards: torch.Tensor,
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    gamma: float,
+    lambd: float,
+):
+    """
+    跳过观测token的GAE计算。
+    """
+    L = rewards.size(0)
+    device = rewards.device
+    dtype = rewards.dtype
+
+    # 获取动作token索引
+    action_indices = torch.where(mask == 1)[0]
+    num_actions = action_indices.size(0)
+    
+    if num_actions == 0:
+        return torch.zeros_like(rewards), torch.zeros_like(rewards)
+
+    # 只对动作token计算
+    action_rewards = rewards[action_indices]
+    action_values = values[action_indices]
+    
+    # 计算动作token之间的间隔（用于跳过观测token）
+    # 对于每个动作token，下一个动作token的索引位置
+    next_action_pos = torch.cat([action_indices[1:], torch.tensor([L], device=device)])
+    
+    # 计算每个动作token的 next_value（下一个动作的value，若不存在则为0）
+    next_values = torch.zeros(num_actions, device=device, dtype=dtype)
+    next_values[:-1] = values[action_indices[1:]]
+    
+    # 注意：奖励只在动作token上，观测token没有奖励（或 reward=0）
+    
+    # 反向递推 GAE（只在动作token之间）
+    gae = 0.0
+    action_advantages = torch.zeros(num_actions, device=device, dtype=dtype)
+    
+    for i in range(num_actions - 1, -1, -1):
+        delta = action_rewards[i] + gamma * next_values[i] - action_values[i]
+        gae = delta + gamma * lambd * gae
+        action_advantages[i] = gae
+    
+    # 构建完整输出
+    advantages = torch.zeros(L, device=device, dtype=dtype)
+    advantages[action_indices] = action_advantages
+    returns = advantages + values
+    
+    return advantages, returns
+
+def single_sequence_gae(
+    rewards: torch.Tensor,   # shape [L]
+    values: torch.Tensor,    # shape [L]
+    gamma: float,
+    lambd: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    对单个序列计算 GAE 优势估计和回报。
+
+    Args:
+        rewards (torch.Tensor): 奖励序列，长度 L。
+        values (torch.Tensor):  价值序列，长度 L。
+        gamma (float):          折扣因子。
+        lambd (float):          GAE lambda 参数。
+
+    Returns:
+        advantages (torch.Tensor): 优势估计，长度 L。
+        returns (torch.Tensor):    回报（优势 + 价值），长度 L。
+    """
+    L = rewards.size(0)
+    device = rewards.device
+    dtype = rewards.dtype
+
+    advantages = torch.zeros_like(rewards)
+    gae = 0.0
+
+    # 反向递推计算 GAE
+    for t in reversed(range(L)):
+        # 下一个时刻的价值，若 t 为最后一步则取 0
+        next_value = values[t + 1] if t < L - 1 else 0.0
+        # TD 误差: δ_t = r_t + γ * V_{t+1} - V_t
+        delta = rewards[t] + gamma * next_value - values[t]
+        # 递推: A_t = δ_t + γ * λ * A_{t+1}
+        gae = delta + gamma * lambd * gae
+        advantages[t] = gae
+
+    # 回报 = 优势 + 价值（标准 PPO 回报）
+    returns = advantages + values
+    return advantages, returns
+
 def get_advantages_and_returns_batch(
+    loss_masks,
+    total_lengths,
+    response_lengths,
+    values_list,
+    rewards_list,
+    gamma,
+    lambd,
+    chunked: bool = True,
+    enable_length_adaptive: bool = False,
+    adaptive_alpha: float = 0.1,  
+    skip_observation=False # for SAO
+):
+    """
+    Batched GAE with CP support.
+    Input:
+        total_lengths:     list[int], each sample's total_len
+        response_lengths:  list[int], each sample's response_len
+        values_list:       list[Tensor], each shape = [resp_len_i]
+        rewards_list:      list[Tensor], same shape
+    Output:
+        advantages_list:   list[Tensor], each shape = [resp_len_i]
+        returns_list:      list[Tensor], same shape
+    """
+
+    from megatron.core import mpu
+
+    with torch.no_grad():
+        B = len(response_lengths)
+        assert B == len(values_list)
+        assert B == len(rewards_list)
+
+        cp_size = mpu.get_context_parallel_world_size()
+        device = values_list[0].device
+        dtype = values_list[0].dtype
+
+        if cp_size > 1:
+            from slime.backends.megatron_utils.cp_utils import all_gather_with_cp
+
+            full_values_list = []
+            full_rewards_list = []
+            full_masks_list = []
+
+            for total_len, resp_len, v, r, m in zip(
+                total_lengths, response_lengths, values_list, rewards_list, loss_masks, strict=False
+            ):
+                full_v = all_gather_with_cp(v, total_len, resp_len)
+                full_r = all_gather_with_cp(r, total_len, resp_len)
+                full_m = all_gather_with_cp(m, total_len, resp_len)
+                full_values_list.append(full_v)
+                full_rewards_list.append(full_r)
+                full_masks_list.append(full_m)
+
+            # full_values_list[i].shape = [total_len_i]
+        else:
+            full_values_list = values_list
+            full_rewards_list = rewards_list
+            full_masks_list = loss_masks
+
+        # pad to max_len for batched GAE
+        max_len = max(response_lengths)
+
+        full_values = torch.zeros(B, max_len, device=device, dtype=dtype)
+        full_rewards = torch.zeros(B, max_len, device=device, dtype=dtype)
+        full_masks = torch.zeros(B, max_len, device=device, dtype=torch.bool)  # 用于skip
+
+        for i in range(B):
+            L = response_lengths[i]
+            full_values[i, :L] = full_values_list[i][:L]
+            full_rewards[i, :L] = full_rewards_list[i][:L]
+            full_masks[i, :L] = full_masks_list[i][:L].bool()
+        
+        if enable_length_adaptive:
+            # 每个样本独立计算自适应 λ
+            lengths = torch.tensor(response_lengths, device=device, dtype=dtype)
+            # 防止除零，并截断范围
+            adaptive_lambdas = 1.0 - 1.0 / (adaptive_alpha * lengths + 1e-8)
+            adaptive_lambdas = torch.clamp(adaptive_lambdas, min=0.0, max=0.999)
+
+            full_advantages = torch.zeros_like(full_values)
+            full_returns = torch.zeros_like(full_values)
+
+            for i in range(B):
+                L = response_lengths[i]
+                if L == 0:
+                    continue
+                rew = full_rewards[i, :L]
+                val = full_values[i, :L]
+                lam = adaptive_lambdas[i].item()
+                mask = full_masks[i, :L]
+
+                if skip_observation:
+                    adv, ret = single_sequence_gae_with_skip_obs(rew, val, mask, gamma, lam)
+                else:
+                    adv, ret = single_sequence_gae(rew, val, gamma, lam)
+                full_advantages[i, :L] = adv
+                full_returns[i, :L] = ret
+        else:
+
+            if not chunked:
+                full_advantages, full_returns = vanilla_gae(
+                    rewards=full_rewards,
+                    values=full_values,
+                    gamma=gamma,
+                    lambd=lambd,
+                )
+            else:
+                full_advantages, full_returns = chunked_gae(
+                    rewards=full_rewards,
+                    values=full_values,
+                    gamma=gamma,
+                    lambd=lambd,
+                )
+
+        advantages_list = []
+        returns_list = []
+
+        if cp_size > 1:
+            from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+            for total_len, resp_len, adv_row, ret_row in zip(
+                total_lengths,
+                response_lengths,
+                full_advantages,
+                full_returns,
+                strict=False,
+            ):
+                adv_full = adv_row  # shape = [resp_len_i padded to max_len]
+                ret_full = ret_row
+
+                adv_sliced = slice_log_prob_with_cp(adv_full[:resp_len], total_len, resp_len)
+                ret_sliced = slice_log_prob_with_cp(ret_full[:resp_len], total_len, resp_len)
+
+                advantages_list.append(adv_sliced)
+                returns_list.append(ret_sliced)
+
+        else:
+            for i in range(B):
+                L = response_lengths[i]
+                advantages_list.append(full_advantages[i, :L])
+                returns_list.append(full_returns[i, :L])
+
+    return advantages_list, returns_list
+
+
+def get_compaction_advantages_and_returns_batch(
+    loss_masks,
+    total_lengths,
+    response_lengths,
+    values_list,
+    rewards_list,
+    gamma,
+    lambd,
+    metadata,
+    chunked: bool = True,
+    enable_length_adaptive: bool = False,
+    adaptive_alpha: float = 1.5,
+    skip_observation=False,
+):
+    """Compute CompactionRL segment-local GAE with cross-segment correction."""
+    advantages, _ = get_advantages_and_returns_batch(
+        loss_masks,
+        total_lengths,
+        response_lengths,
+        values_list,
+        rewards_list,
+        gamma,
+        lambd,
+        chunked=chunked,
+        enable_length_adaptive=enable_length_adaptive,
+        adaptive_alpha=adaptive_alpha,
+        skip_observation=skip_observation,
+    )
+
+    corrected_advantages = []
+    corrected_returns = []
+    for i, (adv, values) in enumerate(zip(advantages, values_list, strict=False)):
+        compaction_meta = {}
+        if metadata and i < len(metadata) and isinstance(metadata[i], dict):
+            compaction_meta = metadata[i].get("compaction") or {}
+
+        n_after = int(compaction_meta.get("n_trainable_after", 0) or 0)
+        if enable_length_adaptive:
+            trainable_count = float(compaction_meta.get("trainable_token_count", response_lengths[i]) or response_lengths[i])
+            effective_lambd = 1.0 - 1.0 / (adaptive_alpha * trainable_count + 1e-8)
+            effective_lambd = min(max(effective_lambd, 0.0), 0.999)
+        else:
+            effective_lambd = lambd
+
+        factor = (gamma * effective_lambd) ** n_after
+        corrected_adv = adv * factor
+        corrected_advantages.append(corrected_adv)
+        corrected_returns.append(corrected_adv + values)
+
+    return corrected_advantages, corrected_returns
+
+
+def get_advantages_and_returns_batch_bk(
     total_lengths,
     response_lengths,
     values_list,

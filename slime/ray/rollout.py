@@ -24,7 +24,7 @@ from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_info, init_http_client
 from slime.utils.logging_utils import configure_logger, init_tracking
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix, compute_statistics_with_staleness
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.types import Sample
 
@@ -101,6 +101,15 @@ def _tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
             rollout_data["rollout_mask_sums"],
             dtype=torch.float32,
         )
+
+
+def _iter_samples(node):
+    if isinstance(node, Sample):
+        yield node
+        return
+    if isinstance(node, list):
+        for item in node:
+            yield from _iter_samples(item)
 
 
 @dataclasses.dataclass
@@ -706,6 +715,125 @@ class RolloutManager:
 
         return raw_rewards, raw_rewards
 
+    def _convert_compaction_samples_to_train_data(
+        self,
+        samples: list[Sample],
+        raw_rewards: list[Any],
+        rewards: list[float],
+        rollout_ids: list[int],
+    ):
+        if getattr(self.args, "rollout_top_p", 1.0) != 1.0:
+            raise ValueError("CompactionRL segment expansion does not support rollout_top_p replay yet.")
+
+        train_data = {
+            "tokens": [],
+            "response_lengths": [],
+            "rewards": [],
+            "raw_reward": [],
+            "answer_format_rewards": [],
+            "tool_call_format_rewards": [],
+            "truncated": [],
+            "sample_indices": [],
+            "rollout_ids": [],
+            "loss_masks": [],
+            "rollout_log_probs": [],
+            "metadata": [],
+            "source_names": [],
+        }
+
+        for sample, raw_reward, reward, rollout_id in zip(samples, raw_rewards, rewards, rollout_ids, strict=True):
+            compaction = (sample.train_metadata or {}).get("compaction")
+            segments = compaction.get("segments", []) if isinstance(compaction, dict) else []
+            if not segments:
+                raise ValueError("CompactionRL is enabled but a sample has no trainable segment metadata.")
+
+            trainable_segments = [
+                segment
+                for segment in segments
+                if segment.get("response_tokens") and int(segment.get("trainable_token_count", 0)) > 0
+            ]
+            if not trainable_segments:
+                raise ValueError("CompactionRL sample has no segment with trainable tokens.")
+
+            n_after_by_segment_id: dict[int, int] = {}
+            n_after = 0
+            for segment in reversed(trainable_segments):
+                n_after_by_segment_id[int(segment["segment_id"])] = n_after
+                n_after += int(segment.get("trainable_token_count", 0))
+
+            final_segment_id = None
+            for segment in trainable_segments:
+                if segment.get("is_final_answer_segment"):
+                    final_segment_id = int(segment["segment_id"])
+            if final_segment_id is None:
+                final_segment_id = int(trainable_segments[-1]["segment_id"])
+
+            answer_format_reward = (
+                float(sample.reward.get("answer_format_reward", 0.0))
+                if isinstance(sample.reward, dict) and sample.reward.get("answer_format_reward") is not None
+                else 0.0
+            )
+            tool_call_format_reward = (
+                float(sample.reward.get("tool_call_format_reward", 0.0))
+                if isinstance(sample.reward, dict) and sample.reward.get("tool_call_format_reward") is not None
+                else 0.0
+            )
+
+            for segment in trainable_segments:
+                prompt_tokens = list(segment["prompt_tokens"])
+                response_tokens = list(segment["response_tokens"])
+                loss_mask = list(segment["loss_mask"])
+                rollout_log_probs = list(segment["rollout_log_probs"])
+
+                assert len(response_tokens) == len(loss_mask), (
+                    f"compaction segment loss mask length {len(loss_mask)} != response length {len(response_tokens)}"
+                )
+                assert len(response_tokens) == len(rollout_log_probs), (
+                    f"compaction segment rollout logprob length {len(rollout_log_probs)} "
+                    f"!= response length {len(response_tokens)}"
+                )
+
+                segment_id = int(segment["segment_id"])
+                is_final_segment = segment_id == final_segment_id
+                train_data["tokens"].append(prompt_tokens + response_tokens)
+                train_data["response_lengths"].append(len(response_tokens))
+                train_data["rewards"].append(reward)
+                train_data["raw_reward"].append(raw_reward)
+                train_data["answer_format_rewards"].append(answer_format_reward if is_final_segment else 0.0)
+                train_data["tool_call_format_rewards"].append(tool_call_format_reward if is_final_segment else 0.0)
+                train_data["truncated"].append(1 if sample.status == Sample.Status.TRUNCATED else 0)
+                train_data["sample_indices"].append(sample.index)
+                train_data["rollout_ids"].append(rollout_id)
+                train_data["loss_masks"].append(loss_mask)
+                train_data["rollout_log_probs"].append(rollout_log_probs)
+                train_data["metadata"].append(
+                    {
+                        "compaction": {
+                            "enabled": True,
+                            "trace_id": rollout_id,
+                            "segment_id": segment_id,
+                            "segment_type": segment.get("type", "execute"),
+                            "segments_per_trace": len(trainable_segments),
+                            "trainable_token_count": int(segment.get("trainable_token_count", 0)),
+                            "n_trainable_after": n_after_by_segment_id[segment_id],
+                            "compact_count": int(compaction.get("compact_count", 0)),
+                            "contains_compaction_prompt": bool(segment.get("contains_compaction_prompt", False)),
+                            "contains_summary": bool(segment.get("contains_summary", False)),
+                            "is_final_answer_segment": is_final_segment,
+                        }
+                    }
+                )
+                train_data["source_names"].append(get_source(sample))
+
+        rollout_id_list = train_data["rollout_ids"]
+        mask_sums_per_sample = [sum(m) for m in train_data["loss_masks"]]
+        rollout_total_mask: dict[int, int] = {}
+        for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
+            rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
+        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+
+        return train_data
+
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
         Convert inference generated samples to training data.
@@ -728,6 +856,15 @@ class RolloutManager:
                 rollout_ids[i] = tmp_id
                 existed_rollout_id_values.add(tmp_id)
 
+        has_compaction_segments = any(
+            isinstance(sample.train_metadata, dict)
+            and isinstance(sample.train_metadata.get("compaction"), dict)
+            and sample.train_metadata["compaction"].get("segments")
+            for sample in samples
+        )
+        if has_compaction_segments:
+            return self._convert_compaction_samples_to_train_data(samples, raw_rewards, rewards, rollout_ids)
+
         train_data = {
             "tokens": [sample.tokens for sample in samples],
             "response_lengths": [sample.response_length for sample in samples],
@@ -735,6 +872,18 @@ class RolloutManager:
             # we could use key to select the reward.
             "rewards": rewards,
             "raw_reward": raw_rewards,
+            "answer_format_rewards": [
+                float(sample.reward.get("answer_format_reward", 0.0))
+                if isinstance(sample.reward, dict) and sample.reward.get("answer_format_reward") is not None
+                else 0.0
+                for sample in samples
+            ],
+            "tool_call_format_rewards": [
+                float(sample.reward.get("tool_call_format_reward", 0.0))
+                if isinstance(sample.reward, dict) and sample.reward.get("tool_call_format_reward") is not None
+                else 0.0
+                for sample in samples
+            ],
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
             "rollout_ids": rollout_ids,
@@ -859,6 +1008,8 @@ class RolloutManager:
                 "multimodal_train_inputs",
                 "response_lengths",
                 "rewards",
+                "answer_format_rewards",
+                "tool_call_format_rewards",
                 "truncated",
                 "loss_masks",
                 "round_number",
@@ -869,6 +1020,7 @@ class RolloutManager:
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
+                "metadata",
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
@@ -1263,10 +1415,12 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = extra_metrics or {}
+    all_eval_samples = []
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
+            all_eval_samples.extend(samples)
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
@@ -1279,6 +1433,12 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                 ),
                 f"eval/{key}-",
             )
+
+    if all_eval_samples:
+        aggregate_eval_metrics = {}
+        aggregate_eval_metrics |= _compute_tool_call_count_metrics(all_eval_samples)
+        aggregate_eval_metrics |= _compute_compaction_count_metrics(all_eval_samples)
+        log_dict |= dict_add_prefix(aggregate_eval_metrics, "eval/")
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
@@ -1306,21 +1466,32 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
 
-
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
+    # off step 统计
+    sample_off_steps = [sample.off_step for sample in samples]
+    # entry delay step 统计: entry_step 与训练 step 之间的 gap
+    sample_entry_delay_steps = [
+        sample.entry_delay_step for sample in samples
+        if sample.entry_delay_step is not None
+    ]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= _compute_tool_call_count_metrics(samples)
+    log_dict |= dict_add_prefix(compute_statistics_with_staleness(sample_off_steps), "sample_off_steps/")
+    if sample_entry_delay_steps:
+        log_dict |= dict_add_prefix(compute_statistics_with_staleness(sample_entry_delay_steps), "sample_entry_delay_steps/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_accuracy_metric(samples)
+    log_dict |= _compute_compaction_metrics(samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
-
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
     non_generation_time = [sample.non_generation_time for sample in samples]
@@ -1484,3 +1655,140 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]):
     samples_of_reward_cat = group_by(all_samples, lambda s: s.reward[reward_cat_key])
 
     return {f"error_cat/{reward_cat}": len(s) / len(all_samples) for reward_cat, s in samples_of_reward_cat.items()}
+
+
+def _reward_accuracy_value(reward: Any) -> float | None:
+    if not isinstance(reward, dict):
+        return None
+
+    acc = reward.get("acc")
+    if acc is not None:
+        if isinstance(acc, str):
+            normalized = acc.strip().lower()
+            if normalized in {"true", "1", "yes"}:
+                return 1.0
+            if normalized in {"false", "0", "no"}:
+                return 0.0
+        return float(bool(acc))
+
+    score = reward.get("score")
+    if score is None:
+        return None
+    try:
+        return 1.0 if float(score) == 1.0 else 0.0
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_accuracy_metric(all_samples: list[Sample]):
+    accuracies = [
+        value
+        for sample in all_samples
+        if (value := _reward_accuracy_value(getattr(sample, "reward", None))) is not None
+    ]
+    if not accuracies:
+        return {}
+    return {"accuracy": float(np.mean(accuracies).item())}
+
+
+def _compute_tool_call_count_metrics(all_samples: list[Sample]):
+    if not all_samples:
+        return {}
+
+    tool_call_counts = [int(getattr(sample, "tool_call_count", 0) or 0) for sample in all_samples]
+    return dict_add_prefix(compute_statistics(tool_call_counts), "tool_call_count/")
+
+
+def _compute_compaction_count_metrics(all_samples: list[Sample]):
+    compaction_samples = [
+        sample
+        for sample in all_samples
+        if isinstance(getattr(sample, "metadata", None), dict) and isinstance(sample.metadata.get("compaction"), dict)
+    ]
+    if not compaction_samples:
+        return {}
+
+    compact_counts = [
+        int(sample.metadata["compaction"].get("compact_count", 0) or 0)
+        for sample in compaction_samples
+    ]
+    return dict_add_prefix(compute_statistics(compact_counts), "compaction_count/")
+
+
+def _compute_compaction_metrics(all_samples: list[Sample]):
+    compaction_samples = [
+        sample
+        for sample in all_samples
+        if isinstance(getattr(sample, "metadata", None), dict) and isinstance(sample.metadata.get("compaction"), dict)
+    ]
+    if not compaction_samples:
+        return {}
+
+    compactions = [sample.metadata["compaction"] for sample in compaction_samples]
+    compact_counts = [int(info.get("compact_count", 0) or 0) for info in compactions]
+    summary_tokens = []
+    execution_tokens = []
+    final_context_lens = []
+    truncated_after_compaction = []
+    before_context_lens = []
+    after_context_lens = []
+    shrink_ratios = []
+    failed_to_shrink = []
+    compact_prompt_tokens = []
+    segments_per_trace = []
+    for sample, info in zip(compaction_samples, compactions, strict=False):
+        segments = info.get("segments") or []
+        events = info.get("events") or []
+        event_summary_tokens = [int(event.get("summary_tokens", 0) or 0) for event in events]
+        event_compact_prompt_tokens = [int(event.get("compact_prompt_tokens", 0) or 0) for event in events]
+        summary_token_total = (
+            sum(event_summary_tokens)
+            if event_summary_tokens
+            else sum(
+                int(segment.get("response_length", 0) or 0)
+                for segment in segments
+                if segment.get("contains_summary")
+            )
+        )
+        total_segment_tokens = sum(int(segment.get("response_length", 0) or 0) for segment in segments)
+        summary_tokens.append(summary_token_total)
+        execution_tokens.append(max(total_segment_tokens - summary_token_total, 0))
+        compact_prompt_tokens.append(sum(event_compact_prompt_tokens))
+        segments_per_trace.append(len(segments))
+        for event in events:
+            before_len = event.get("before_context_len")
+            after_len = event.get("after_context_len")
+            if before_len is not None:
+                before_context_lens.append(float(before_len))
+            if after_len is not None:
+                after_context_lens.append(float(after_len))
+            if before_len is not None and after_len is not None:
+                shrink_ratios.append(1.0 - float(after_len) / max(float(before_len), 1.0))
+            failed_to_shrink.append(int(bool(event.get("failed_to_shrink", False))))
+        if info.get("final_context_len") is not None:
+            final_context_lens.append(float(info["final_context_len"]))
+        truncated_after_compaction.append(
+            int(int(info.get("compact_count", 0) or 0) > 0 and sample.status == Sample.Status.TRUNCATED)
+        )
+
+    metrics = {
+        **_compute_compaction_count_metrics(compaction_samples),
+        "compact_count_mean": float(np.mean(compact_counts).item()),
+        "compact_triggered_ratio": float(np.mean([int(x > 0) for x in compact_counts]).item()),
+        "summary_tokens_mean": float(np.mean(summary_tokens).item()),
+        "execution_tokens_mean": float(np.mean(execution_tokens).item()),
+        "compaction_prompt_tokens_mean": float(np.mean(compact_prompt_tokens).item()),
+        "segments_per_trace_mean": float(np.mean(segments_per_trace).item()),
+        "truncated_after_compaction_ratio": float(np.mean(truncated_after_compaction).item()),
+    }
+    if before_context_lens:
+        metrics["compaction_before_context_len_mean"] = float(np.mean(before_context_lens).item())
+    if after_context_lens:
+        metrics["compaction_after_context_len_mean"] = float(np.mean(after_context_lens).item())
+    if shrink_ratios:
+        metrics["compaction_shrink_ratio_mean"] = float(np.mean(shrink_ratios).item())
+    if failed_to_shrink:
+        metrics["compaction_failed_to_shrink_ratio"] = float(np.mean(failed_to_shrink).item())
+    if final_context_lens:
+        metrics["effective_context_tokens_mean"] = float(np.mean(final_context_lens).item())
+    return metrics
